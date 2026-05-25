@@ -1,0 +1,989 @@
+Option Explicit
+
+' ================================================================
+'  PEPS DISPATCH READINESS TOOL â€” Pure VBA Macro
+'  Two buttons: ProcessData | SaveToHistory
+'  Excel 2019, Windows, No Python dependency
+' ================================================================
+
+Const SRC_DISPATCH   As String = "SRC_Dispatch"
+Const SRC_PRODUCTION As String = "SRC_Production"
+Const SRC_STOCK      As String = "SRC_Stock"
+Const SH_SUMMARY     As String = "Customer Summary"
+Const SH_DETAIL      As String = "Dispatch Detail"
+Const SH_ITEM        As String = "Item Stock Position"
+Const SH_CP          As String = "CONTROL PANEL"
+Const SH_HISTORY     As String = "History"
+Const MAX_HIST_ROWS  As Long = 50000
+Const DATA_START_ROW As Long = 4     ' data starts row 4 in SRC sheets
+Const HDR_ROW        As Long = 3     ' headers in row 3
+Const OUT_HDR_ROW    As Long = 4     ' output sheet headers row 4
+Const OUT_DATA_START As Long = 5     ' output data from row 5
+
+' â”€â”€ Column indices in SRC_Dispatch (row 3 = headers, data from row 4) â”€
+' We read by header name for safety
+Dim colDP As Object  ' Dictionary: header -> col index
+
+' â”€â”€ Dispatch Detail column positions (fixed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+Const DD_CUST_CODE  As Integer = 1
+Const DD_CUST_NAME  As Integer = 2
+Const DD_SHIP_ID    As Integer = 3
+Const DD_CITY       As Integer = 4
+Const DD_AREA       As Integer = 5
+Const DD_DISTRICT   As Integer = 6
+Const DD_STATE      As Integer = 7
+Const DD_PINCODE    As Integer = 8
+Const DD_PHONE      As Integer = 9
+Const DD_SP_CODE    As Integer = 10
+Const DD_SP_NAME    As Integer = 11
+Const DD_SO_NUM     As Integer = 12
+Const DD_SO_DATE    As Integer = 13
+Const DD_REQ_DATE   As Integer = 14
+Const DD_OVERDUE    As Integer = 15
+Const DD_SO_REM     As Integer = 16
+Const DD_PS_NUM     As Integer = 17
+Const DD_PS_DATE    As Integer = 18
+Const DD_PS_STATUS  As Integer = 19
+Const DD_ITEM_CODE  As Integer = 20
+Const DD_ITEM_DESC  As Integer = 21
+Const DD_ITEM_CAT   As Integer = 22
+Const DD_ITEM_AG    As Integer = 23
+Const DD_ORD_QTY    As Integer = 24
+Const DD_SHIP_QTY   As Integer = 25
+Const DD_PEND_QTY   As Integer = 26
+Const DD_FLOOR_STK  As Integer = 27
+Const DD_ALLOC_QTY  As Integer = 28
+Const DD_SHORT_QTY  As Integer = 29
+Const DD_STATUS     As Integer = 30
+Const DD_INV_NUM    As Integer = 31
+Const DD_INV_DATE   As Integer = 32
+Const DD_INV_QTY    As Integer = 33
+Const DD_INV_STAT   As Integer = 34
+Const DD_MO_FLAG    As Integer = 35
+Const DD_MO_REM     As Integer = 36
+Const DD_MO_QTY     As Integer = 37
+Const DD_TOTAL_COLS As Integer = 37
+
+' ================================================================
+'  BUTTON 1: Enter Date (InputBox)
+' ================================================================
+Sub EnterDate()
+    Dim ws  As Worksheet
+    Dim d   As String
+    Set ws = ThisWorkbook.Sheets(SH_CP)
+    d = InputBox("Enter today's run date (DD/MM/YYYY):", "PEPS â€” Set Run Date", ws.Cells(14, 4).Value)
+    If d = "" Then Exit Sub
+    ' Basic format check
+    If Not IsDate(d) Then
+        MsgBox "Invalid date format. Please use DD/MM/YYYY.", vbExclamation, "PEPS"
+        Exit Sub
+    End If
+    ws.Cells(14, 4).Value = d
+    MsgBox "Date set to: " & d, vbInformation, "PEPS"
+End Sub
+
+' ================================================================
+'  BUTTON 2: PROCESS DATA
+' ================================================================
+Sub ProcessData()
+
+    Dim wsDP  As Worksheet, wsPR As Worksheet
+    Dim wsSUM As Worksheet, wsDET As Worksheet, wsITM As Worksheet
+    Dim wsCP  As Worksheet
+    Dim runDate As String, runDateSerial As Long
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.StatusBar = "PEPS: Processing... please wait"
+
+    Set wsCP = ThisWorkbook.Sheets(SH_CP)
+    runDate = Trim(CStr(wsCP.Cells(14, 4).Value))
+
+    ' Validate date
+    If runDate = "" Then
+        MsgBox "Please set the Run Date on CONTROL PANEL before processing.", vbExclamation, "PEPS"
+        GoTo Cleanup
+    End If
+    If Not IsDate(runDate) Then
+        MsgBox "Run Date '" & runDate & "' is not a valid date. Use DD/MM/YYYY format.", vbExclamation, "PEPS"
+        GoTo Cleanup
+    End If
+    runDateSerial = CLng(CDate(runDate))
+
+    Set wsDP = ThisWorkbook.Sheets(SRC_DISPATCH)
+    Set wsPR = ThisWorkbook.Sheets(SRC_PRODUCTION)
+    Set wsSUM = ThisWorkbook.Sheets(SH_SUMMARY)
+    Set wsDET = ThisWorkbook.Sheets(SH_DETAIL)
+    Set wsITM = ThisWorkbook.Sheets(SH_ITEM)
+
+    ' â”€â”€ Check if SRC_Dispatch has data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Dim dpLastRow As Long
+    dpLastRow = GetLastRow(wsDP, DATA_START_ROW)
+    If dpLastRow < DATA_START_ROW Then
+        Call ClearOutputSheets(wsSUM, wsDET, wsITM)
+        wsCP.Cells(16, 2).Value = "Status: No data in SRC_Dispatch â€” output sheets cleared."
+        wsCP.Cells(16, 2).Interior.Color = RGB(255, 235, 156)
+        GoTo Cleanup
+    End If
+
+    wsCP.Cells(16, 2).Value = "Status: Processing..."
+    wsCP.Cells(16, 2).Interior.Color = RGB(255, 235, 156)
+    DoEvents
+
+    ' â”€â”€ Read column map for SRC_Dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Dim dpCols As Object
+    Set dpCols = BuildColMap(wsDP, HDR_ROW)
+
+    ' â”€â”€ Read SRC_Production floor stock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Dim prLastRow As Long
+    prLastRow = GetLastRow(wsPR, DATA_START_ROW)
+    Dim floorStock As Object   ' item code -> completed count
+    Set floorStock = CreateObject("Scripting.Dictionary")
+
+    If prLastRow >= DATA_START_ROW Then
+        Dim prCols As Object
+        Set prCols = BuildColMap(wsPR, HDR_ROW)
+        If prCols.Exists("Item Code") And prCols.Exists("Production Status") Then
+            Dim prIC As Integer, prPS As Integer
+            prIC = prCols("Item Code")
+            prPS = prCols("Production Status")
+            Dim pi As Long
+            For pi = DATA_START_ROW To prLastRow
+                Dim prItem As String, prStat As String
+                prItem = Trim(CStr(wsPR.Cells(pi, prIC).Value))
+                prStat = Trim(CStr(wsPR.Cells(pi, prPS).Value))
+                If UCase(prStat) = "COMPLETED" And prItem <> "" Then
+                    If floorStock.Exists(prItem) Then
+                        floorStock(prItem) = floorStock(prItem) + 1
+                    Else
+                        floorStock.Add prItem, 1
+                    End If
+                End If
+            Next pi
+        End If
+    End If
+
+    ' â”€â”€ Get DP column indices â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Dim c_SONum  As Integer, c_SODate As Integer, c_SOStat As Integer
+    Dim c_CustCode As Integer, c_CustName As Integer
+    Dim c_ShipId As Integer, c_City As Integer, c_Area As Integer
+    Dim c_Dist As Integer, c_State As Integer, c_Zip As Integer
+    Dim c_Phone As Integer, c_SPCode As Integer, c_SPName As Integer
+    Dim c_ItemCode As Integer, c_ItemDesc As Integer
+    Dim c_ItemCat As Integer, c_ItemAG As Integer
+    Dim c_OrdQty As Integer, c_ShipQty As Integer
+    Dim c_PendQty As Integer, c_PSNum As Integer
+    Dim c_ShipDate As Integer, c_PSStat As Integer
+    Dim c_SORemk As Integer, c_ReqDate As Integer
+    Dim c_InvNum As Integer, c_InvDate As Integer
+    Dim c_InvQty As Integer, c_InvStat As Integer
+    Dim c_InvStatus As Integer
+
+    c_SONum = SafeCol(dpCols, "Sale Order Number")
+    c_SODate = SafeCol(dpCols, "Sales Order Date")
+    c_SOStat = SafeCol(dpCols, "Sales Order Status")
+    c_CustCode = SafeCol(dpCols, "Customer Code")
+    c_CustName = SafeCol(dpCols, "Customer Name")
+    c_ShipId = SafeCol(dpCols, "Ship to Id")
+    c_City = SafeCol(dpCols, "City")
+    c_Area = SafeCol(dpCols, "Area")
+    c_Dist = SafeCol(dpCols, "District")
+    c_State = SafeCol(dpCols, "State")
+    c_Zip = SafeCol(dpCols, "Zip code")
+    c_Phone = SafeCol(dpCols, "Phone No.")
+    c_SPCode = SafeCol(dpCols, "Sales Person Code")
+    c_SPName = SafeCol(dpCols, "Sales Person Name")
+    c_ItemCode = SafeCol(dpCols, "Item Code")
+    c_ItemDesc = SafeCol(dpCols, "Item Description")
+    c_ItemCat = SafeCol(dpCols, "Item Category")
+    c_ItemAG = SafeCol(dpCols, "Item Account Group")
+    c_OrdQty = SafeCol(dpCols, "Ordered Quantity")
+    c_ShipQty = SafeCol(dpCols, "Shipped Quantity")
+    c_PendQty = SafeCol(dpCols, "Pending Qty After Packslip")
+    c_PSNum = SafeCol(dpCols, "Pack Slip Number")
+    c_ShipDate = SafeCol(dpCols, "Shipped Date")
+    c_PSStat = SafeCol(dpCols, "Pack Slip Status")
+    c_SORemk = SafeCol(dpCols, "Sales Order Remarks")
+    c_ReqDate = SafeCol(dpCols, "Required Date")
+    c_InvNum = SafeCol(dpCols, "Invoice Number")
+    c_InvDate = SafeCol(dpCols, "Invoice Date")
+    c_InvQty = SafeCol(dpCols, "Invoiced Quantity")
+    c_InvStat = SafeCol(dpCols, "Invoice Status")
+
+    ' â”€â”€ First pass: collect filtered rows, sort by ItemCode+SODate â”€â”€
+    ' Store as array of variants for speed
+    Dim rawData() As Variant
+    Dim rawCount As Long
+    rawCount = 0
+    ReDim rawData(1 To dpLastRow - DATA_START_ROW + 1, 1 To 5)
+    ' cols: 1=ItemCode, 2=SODate serial, 3=ReqDate serial, 4=PendQty, 5=row index
+
+    Dim di As Long
+    For di = DATA_START_ROW To dpLastRow
+        ' Filter criteria
+        Dim soCat   As String, soStat As String
+        Dim psStat  As String, invStat As String
+        Dim pendQty As Double
+
+        soStat = Trim(CStr(wsDP.Cells(di, c_SOStat).Value))
+        soCat = Trim(CStr(wsDP.Cells(di, c_ItemCat).Value))
+        psStat = Trim(UCase(CStr(wsDP.Cells(di, c_PSStat).Value)))
+        invStat = Trim(CStr(wsDP.Cells(di, c_InvStat).Value))
+
+        If wsDP.Cells(di, c_PendQty).Value = "" Or IsNull(wsDP.Cells(di, c_PendQty).Value) Then
+            pendQty = 0
+        Else
+            pendQty = CDbl(wsDP.Cells(di, c_PendQty).Value)
+        End If
+
+        ' Apply filters
+        If (soCat = "MATRESS" Or soCat = "FOAM") And _
+           (soStat = "Authorized" Or soStat = "Closed") And _
+           (invStat = "") And _
+           (psStat = "SHIPPED" Or psStat = "ALLOCATED" Or psStat = "") And _
+           (pendQty > 0) Then
+
+            rawCount = rawCount + 1
+            rawData(rawCount, 1) = Trim(CStr(wsDP.Cells(di, c_ItemCode).Value))
+
+            Dim soDateVal As Long, reqDateVal As Long
+            soDateVal = 0: reqDateVal = 0
+            If IsDate(wsDP.Cells(di, c_SODate).Value) Then soDateVal = CLng(CDate(wsDP.Cells(di, c_SODate).Value))
+            If IsDate(wsDP.Cells(di, c_ReqDate).Value) Then reqDateVal = CLng(CDate(wsDP.Cells(di, c_ReqDate).Value))
+
+            rawData(rawCount, 2) = soDateVal
+            rawData(rawCount, 3) = reqDateVal
+            rawData(rawCount, 4) = pendQty
+            rawData(rawCount, 5) = di
+        End If
+    Next di
+
+    If rawCount = 0 Then
+        Call ClearOutputSheets(wsSUM, wsDET, wsITM)
+        wsCP.Cells(16, 2).Value = "Status: No matching order lines found after filters."
+        wsCP.Cells(16, 2).Interior.Color = RGB(255, 235, 156)
+        GoTo Cleanup
+    End If
+
+    ' â”€â”€ Sort rawData by ItemCode, SODate, ReqDate (bubble â€” fast enough for ~2000 rows) â”€â”€
+    Application.StatusBar = "PEPS: Sorting " & rawCount & " rows..."
+    Dim si As Long, sj As Long, tmpV As Variant
+    Dim tmpArr(1 To 5) As Variant
+    For si = 1 To rawCount - 1
+        For sj = 1 To rawCount - si
+            Dim a1 As String, a2 As String
+            a1 = rawData(sj, 1) & Format(rawData(sj, 2), "00000000") & Format(rawData(sj, 3), "00000000")
+            a2 = rawData(sj + 1, 1) & Format(rawData(sj + 1, 2), "00000000") & Format(rawData(sj + 1, 3), "00000000")
+            If a1 > a2 Then
+                Dim k As Integer
+                For k = 1 To 5
+                    tmpArr(k) = rawData(sj, k)
+                    rawData(sj, k) = rawData(sj + 1, k)
+                    rawData(sj + 1, k) = tmpArr(k)
+                Next k
+            End If
+        Next sj
+    Next si
+
+    ' â”€â”€ FIFO allocation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Application.StatusBar = "PEPS: Allocating floor stock FIFO..."
+    Dim allocTracker As Object
+    Set allocTracker = CreateObject("Scripting.Dictionary")
+
+    ' â”€â”€ Clear output sheets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Call ClearOutputSheets(wsSUM, wsDET, wsITM)
+
+    ' â”€â”€ Write Dispatch Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Application.StatusBar = "PEPS: Writing Dispatch Detail..."
+    Dim detRow As Long
+    detRow = OUT_DATA_START
+
+    ' Track for summary: custKey -> array(totalLines, ready, partial, pending, overdue, pendQty, allocQty, shortQty)
+    Dim custSum As Object
+    Set custSum = CreateObject("Scripting.Dictionary")
+    ' Also track customer info
+    Dim custInfo As Object
+    Set custInfo = CreateObject("Scripting.Dictionary")
+    ' Track item summary
+    Dim itemSum As Object
+    Set itemSum = CreateObject("Scripting.Dictionary")
+    Dim itemInfo As Object
+    Set itemInfo = CreateObject("Scripting.Dictionary")
+
+    Dim ri As Long
+    For ri = 1 To rawCount
+        Dim srcRow As Long
+        srcRow = rawData(ri, 5)
+        Dim itemCode As String
+        itemCode = rawData(ri, 1)
+        Dim needed As Long
+        needed = CLng(rawData(ri, 4))
+
+        ' Get/init floor stock
+        If Not allocTracker.Exists(itemCode) Then
+            Dim fs As Long
+            fs = 0
+            If floorStock.Exists(itemCode) Then fs = floorStock(itemCode)
+            allocTracker.Add itemCode, fs
+        End If
+
+        Dim avail As Long, allocQty As Long, shortQty As Long
+        avail = allocTracker(itemCode)
+        allocQty = IIf(avail >= needed, needed, avail)
+        shortQty = needed - allocQty
+        allocTracker(itemCode) = avail - allocQty
+
+        Dim dispStatus As String
+        If allocQty > 0 And shortQty = 0 Then
+            dispStatus = "Ready for Dispatch"
+        ElseIf allocQty > 0 And shortQty > 0 Then
+            dispStatus = "Partial - Pending Production"
+        Else
+            dispStatus = "Pending Production"
+        End If
+
+        ' Overdue check
+        Dim isOverdue As Boolean
+        isOverdue = False
+        Dim reqDateS As Long
+        reqDateS = rawData(ri, 3)
+        If reqDateS > 0 And reqDateS < runDateSerial Then isOverdue = True
+
+        ' Format dates
+        Dim soDateStr As String, reqDateStr As String, psDateStr As String, invDateStr As String
+        soDateStr = FormatDateCell(wsDP.Cells(srcRow, c_SODate).Value)
+        reqDateStr = FormatDateCell(wsDP.Cells(srcRow, c_ReqDate).Value)
+        psDateStr = FormatDateCell(wsDP.Cells(srcRow, c_ShipDate).Value)
+        invDateStr = FormatDateCell(wsDP.Cells(srcRow, c_InvDate).Value)
+
+        Dim floorStockVal As Long
+        If floorStock.Exists(itemCode) Then floorStockVal = floorStock(itemCode) Else floorStockVal = 0
+
+        ' Write row to Dispatch Detail
+        With wsDET
+            .Cells(detRow, DD_CUST_CODE) = SafeStr(wsDP.Cells(srcRow, c_CustCode))
+            .Cells(detRow, DD_CUST_NAME) = SafeStr(wsDP.Cells(srcRow, c_CustName))
+            .Cells(detRow, DD_SHIP_ID) = SafeStr(wsDP.Cells(srcRow, c_ShipId))
+            .Cells(detRow, DD_CITY) = SafeStr(wsDP.Cells(srcRow, c_City))
+            .Cells(detRow, DD_AREA) = SafeStr(wsDP.Cells(srcRow, c_Area))
+            .Cells(detRow, DD_DISTRICT) = SafeStr(wsDP.Cells(srcRow, c_Dist))
+            .Cells(detRow, DD_STATE) = SafeStr(wsDP.Cells(srcRow, c_State))
+            .Cells(detRow, DD_PINCODE) = SafeStr(wsDP.Cells(srcRow, c_Zip))
+            .Cells(detRow, DD_PHONE) = SafeStr(wsDP.Cells(srcRow, c_Phone))
+            .Cells(detRow, DD_SP_CODE) = SafeStr(wsDP.Cells(srcRow, c_SPCode))
+            .Cells(detRow, DD_SP_NAME) = SafeStr(wsDP.Cells(srcRow, c_SPName))
+            .Cells(detRow, DD_SO_NUM) = SafeStr(wsDP.Cells(srcRow, c_SONum))
+            .Cells(detRow, DD_SO_DATE) = soDateStr
+            .Cells(detRow, DD_REQ_DATE) = reqDateStr
+            .Cells(detRow, DD_OVERDUE) = IIf(isOverdue, "YES", "")
+            .Cells(detRow, DD_SO_REM) = SafeStr(wsDP.Cells(srcRow, c_SORemk))
+            .Cells(detRow, DD_PS_NUM) = SafeStr(wsDP.Cells(srcRow, c_PSNum))
+            .Cells(detRow, DD_PS_DATE) = psDateStr
+            .Cells(detRow, DD_PS_STATUS) = SafeStr(wsDP.Cells(srcRow, c_PSStat))
+            .Cells(detRow, DD_ITEM_CODE) = itemCode
+            .Cells(detRow, DD_ITEM_DESC) = SafeStr(wsDP.Cells(srcRow, c_ItemDesc))
+            .Cells(detRow, DD_ITEM_CAT) = SafeStr(wsDP.Cells(srcRow, c_ItemCat))
+            .Cells(detRow, DD_ITEM_AG) = SafeStr(wsDP.Cells(srcRow, c_ItemAG))
+            .Cells(detRow, DD_ORD_QTY) = SafeNum(wsDP.Cells(srcRow, c_OrdQty))
+            .Cells(detRow, DD_SHIP_QTY) = SafeNum(wsDP.Cells(srcRow, c_ShipQty))
+            .Cells(detRow, DD_PEND_QTY) = needed
+            .Cells(detRow, DD_FLOOR_STK) = floorStockVal
+            .Cells(detRow, DD_ALLOC_QTY) = allocQty
+            .Cells(detRow, DD_SHORT_QTY) = shortQty
+            .Cells(detRow, DD_STATUS) = dispStatus
+            .Cells(detRow, DD_INV_NUM) = SafeStr(wsDP.Cells(srcRow, c_InvNum))
+            .Cells(detRow, DD_INV_DATE) = invDateStr
+            .Cells(detRow, DD_INV_QTY) = SafeNum(wsDP.Cells(srcRow, c_InvQty))
+            .Cells(detRow, DD_INV_STAT) = SafeStr(wsDP.Cells(srcRow, c_InvStat))
+            .Cells(detRow, DD_MO_FLAG) = ""
+            .Cells(detRow, DD_MO_REM) = ""
+            .Cells(detRow, DD_MO_QTY) = ""
+        End With
+
+        ' Apply row formatting
+        Call FormatDetailRow(wsDET, detRow, dispStatus, isOverdue, "")
+
+        ' Accumulate customer summary
+        Dim custKey As String
+        custKey = SafeStr(wsDP.Cells(srcRow, c_CustCode)) & "|" & SafeStr(wsDP.Cells(srcRow, c_CustName))
+        If Not custSum.Exists(custKey) Then
+            custSum.Add custKey, Array(0, 0, 0, 0, 0, 0, 0, 0)
+            custInfo.Add custKey, Array( _
+                SafeStr(wsDP.Cells(srcRow, c_CustCode)), _
+                SafeStr(wsDP.Cells(srcRow, c_CustName)), _
+                SafeStr(wsDP.Cells(srcRow, c_City)), _
+                SafeStr(wsDP.Cells(srcRow, c_State)), _
+                SafeStr(wsDP.Cells(srcRow, c_Zip)))
+        End If
+        Dim cs As Variant
+        cs = custSum(custKey)
+        cs(0) = cs(0) + 1  ' total lines
+        If dispStatus = "Ready for Dispatch" Then cs(1) = cs(1) + 1
+        If dispStatus = "Partial - Pending Production" Then cs(2) = cs(2) + 1
+        If dispStatus = "Pending Production" Then cs(3) = cs(3) + 1
+        If isOverdue Then cs(4) = cs(4) + 1
+        cs(5) = cs(5) + needed
+        cs(6) = cs(6) + allocQty
+        cs(7) = cs(7) + shortQty
+        custSum(custKey) = cs
+
+        ' Item summary
+        If Not itemSum.Exists(itemCode) Then
+            itemSum.Add itemCode, Array(floorStockVal, 0, 0, 0)
+            itemInfo.Add itemCode, SafeStr(wsDP.Cells(srcRow, c_ItemDesc))
+        End If
+        Dim its As Variant
+        its = itemSum(itemCode)
+        its(1) = its(1) + needed
+        its(2) = its(2) + allocQty
+        its(3) = its(3) + shortQty
+        itemSum(itemCode) = its
+
+        detRow = detRow + 1
+    Next ri
+
+    ' â”€â”€ Update titles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    wsDET.Cells(1, 1).Value = "PEPS DISPATCH DETAIL â€” Customer-wise Item Availability  |  Run: " & runDate
+    wsDET.Cells(2, 1).Value = (detRow - OUT_DATA_START) & " open order lines | FIFO by Sales Order Date | Override cols 35-37 (last): Flag â†’ Remarks â†’ Qty"
+
+    ' Re-apply dropdown for override flag col (in case rows extend)
+    Dim dvRange As String
+    dvRange = "AJ5:AJ" & (detRow + 5000)
+    With wsDET.Cells(OUT_DATA_START, DD_MO_FLAG).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, Formula1:="YES,NO,"
+        .IgnoreBlank = True
+        .InCellDropdown = True
+    End With
+
+    ' â”€â”€ Write Customer Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Application.StatusBar = "PEPS: Writing Customer Summary..."
+    Dim sumRow As Long
+    sumRow = OUT_DATA_START
+    Dim ck As Variant
+    For Each ck In custSum.Keys
+        Dim ci2 As Variant, cs2 As Variant
+        ci2 = custInfo(ck)
+        cs2 = custSum(ck)
+        With wsSUM
+            .Cells(sumRow, 1) = ci2(0)    ' code
+            .Cells(sumRow, 2) = ci2(1)    ' name
+            .Cells(sumRow, 3) = ci2(2)    ' city
+            .Cells(sumRow, 4) = ci2(3)    ' state
+            .Cells(sumRow, 5) = ci2(4)    ' pincode
+            .Cells(sumRow, 6) = cs2(0)    ' total
+            .Cells(sumRow, 7) = cs2(1)    ' ready
+            .Cells(sumRow, 8) = cs2(2)    ' partial
+            .Cells(sumRow, 9) = cs2(3)    ' pending
+            .Cells(sumRow, 10) = cs2(4)   ' overdue
+            .Cells(sumRow, 11) = cs2(5)   ' pend qty
+            .Cells(sumRow, 12) = cs2(6)   ' alloc qty
+            .Cells(sumRow, 13) = cs2(7)   ' shortfall
+        End With
+        Call FormatSummaryRow(wsSUM, sumRow, cs2)
+        sumRow = sumRow + 1
+    Next ck
+    wsSUM.Cells(1, 1).Value = "PEPS DISPATCH READINESS â€” CUSTOMER SUMMARY  |  Run: " & runDate
+    wsSUM.Cells(2, 1).Value = "Customers: " & custSum.Count & "  |  Lines: " & (detRow - OUT_DATA_START)
+
+    ' â”€â”€ Write Item Stock Position â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    Application.StatusBar = "PEPS: Writing Item Stock Position..."
+    ' Sort items by shortfall desc (simple approach using array)
+    Dim itemKeys() As String
+    ReDim itemKeys(0 To itemSum.Count - 1)
+    Dim ikIdx As Integer: ikIdx = 0
+    Dim ik As Variant
+    For Each ik In itemSum.Keys
+        itemKeys(ikIdx) = ik: ikIdx = ikIdx + 1
+    Next ik
+    ' Bubble sort by shortfall desc
+    Dim isi As Integer, isj As Integer, tmpKey As String
+    For isi = 0 To UBound(itemKeys) - 1
+        For isj = 0 To UBound(itemKeys) - 1 - isi
+            If itemSum(itemKeys(isj))(3) < itemSum(itemKeys(isj + 1))(3) Then
+                tmpKey = itemKeys(isj)
+                itemKeys(isj) = itemKeys(isj + 1)
+                itemKeys(isj + 1) = tmpKey
+            End If
+        Next isj
+    Next isi
+
+    Dim itmRow As Long
+    itmRow = OUT_DATA_START - 1   ' item sheet data starts row 4
+    For isi = 0 To UBound(itemKeys)
+        itmRow = itmRow + 1
+        Dim ikey As String: ikey = itemKeys(isi)
+        Dim isArr As Variant: isArr = itemSum(ikey)
+        With wsITM
+            .Cells(itmRow, 1) = ikey
+            .Cells(itmRow, 2) = itemInfo(ikey)
+            .Cells(itmRow, 3) = isArr(0)
+            .Cells(itmRow, 4) = isArr(1)
+            .Cells(itmRow, 5) = isArr(2)
+            .Cells(itmRow, 6) = isArr(3)
+        End With
+        Call FormatItemRow(wsITM, itmRow, isArr)
+    Next isi
+    wsITM.Cells(1, 1).Value = "PEPS ITEM-WISE FLOOR STOCK vs DEMAND  |  Run: " & runDate
+
+    ' â”€â”€ Done â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    wsCP.Cells(16, 2).Value = "Status: DONE â€” " & (detRow - OUT_DATA_START) & " lines processed  |  Run: " & runDate & "  |  " & Now()
+    wsCP.Cells(16, 2).Interior.Color = RGB(198, 239, 206)
+    wsCP.Cells(16, 2).Font.Color = RGB(55, 86, 35)
+    Application.StatusBar = False
+    MsgBox "PROCESS DATA complete!" & vbNewLine & _
+           "Lines: " & (detRow - OUT_DATA_START) & "  |  Customers: " & custSum.Count & vbNewLine & _
+           "Check Customer Summary for today's dispatch plan.", vbInformation, "PEPS â€” Done"
+
+Cleanup:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.StatusBar = False
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Error in ProcessData: " & vbNewLine & Err.Description & vbNewLine & _
+           "Line: " & Erl, vbCritical, "PEPS Error"
+    wsCP.Cells(16, 2).Value = "Status: ERROR â€” " & Err.Description
+    wsCP.Cells(16, 2).Interior.Color = RGB(255, 199, 206)
+    Resume Cleanup
+End Sub
+
+' ================================================================
+'  BUTTON 3: SAVE TO HISTORY
+' ================================================================
+Sub SaveToHistory()
+
+    Dim wsCP As Worksheet, wsDET As Worksheet, wsH As Worksheet
+    Dim runDate As String
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+
+    Set wsCP = ThisWorkbook.Sheets(SH_CP)
+    Set wsDET = ThisWorkbook.Sheets(SH_DETAIL)
+
+    runDate = Trim(CStr(wsCP.Cells(14, 4).Value))
+    If runDate = "" Then
+        MsgBox "Run Date is blank.", vbExclamation
+        GoTo Cleanup
+    End If
+
+    Dim detLast As Long
+    detLast = GetLastRow(wsDET, OUT_DATA_START)
+    If detLast < OUT_DATA_START Then
+        MsgBox "Run PROCESS DATA first.", vbExclamation
+        GoTo Cleanup
+    End If
+
+    Set wsH = GetCurrentHistorySheet()
+    If wsH Is Nothing Then
+        MsgBox "History sheet missing.", vbCritical
+        GoTo Cleanup
+    End If
+
+    Dim histLast As Long
+    histLast = GetLastRow(wsH, 4)
+
+    Dim histMap As Object
+    Set histMap = CreateObject("Scripting.Dictionary")
+
+    Dim hi As Long
+    For hi = 4 To histLast
+        Dim hKey As String
+        hKey = Trim(wsH.Cells(hi, DD_SO_NUM + 1).Value) & "|" & _
+               Trim(wsH.Cells(hi, DD_ITEM_CODE + 1).Value) & "|" & _
+               Trim(wsH.Cells(hi, DD_PS_NUM + 1).Value)
+
+        If hKey <> "||" Then
+            If Not histMap.Exists(hKey) Then histMap.Add hKey, hi
+        End If
+    Next hi
+
+    Dim di As Long, newRows As Long, updRows As Long
+
+    For di = OUT_DATA_START To detLast
+
+        Dim dKey As String
+        dKey = Trim(wsDET.Cells(di, DD_SO_NUM).Value) & "|" & _
+               Trim(wsDET.Cells(di, DD_ITEM_CODE).Value) & "|" & _
+               Trim(wsDET.Cells(di, DD_PS_NUM).Value)
+
+        If dKey = "||" Then GoTo NextRow
+
+        If histMap.Exists(dKey) Then
+            ' UPDATE
+            Dim hRow As Long
+            hRow = histMap(dKey)
+
+            wsH.Cells(hRow, DD_MO_FLAG + 1).Value = wsDET.Cells(di, DD_MO_FLAG).Value
+            wsH.Cells(hRow, DD_MO_REM + 1).Value = wsDET.Cells(di, DD_MO_REM).Value
+            wsH.Cells(hRow, DD_MO_QTY + 1).Value = wsDET.Cells(di, DD_MO_QTY).Value
+
+            updRows = updRows + 1
+
+        Else
+            ' APPEND
+            Dim newRow As Long
+            newRow = histLast + 1
+            histLast = newRow
+
+            ' Column 1 = Worked Date
+            wsH.Cells(newRow, 1).Value = runDate
+
+            ' Shifted copy (Detail ? History col +1)
+            Dim ci As Integer
+            For ci = 1 To DD_TOTAL_COLS
+                wsH.Cells(newRow, ci + 1).Value = wsDET.Cells(di, ci).Value
+            Next ci
+
+            histMap.Add dKey, newRow
+            newRows = newRows + 1
+        End If
+
+NextRow:
+    Next di
+
+    wsCP.Cells(16, 2).Value = "History saved — " & newRows & " new, " & updRows & " updated"
+
+Cleanup:
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "Error: " & Err.Description, vbCritical
+    Resume Cleanup
+
+End Sub
+
+' ================================================================
+'  HELPER FUNCTIONS
+' ================================================================
+
+Function GetLastRow(ws As Worksheet, fromRow As Long) As Long
+    Dim lr As Long
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lr < fromRow Then
+        GetLastRow = fromRow - 1
+    Else
+        GetLastRow = lr
+    End If
+End Function
+
+Function BuildColMap(ws As Worksheet, hdrRow As Long) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    Dim ci As Integer
+    ci = 1
+    Do While ws.Cells(hdrRow, ci).Value <> ""
+        d(CStr(ws.Cells(hdrRow, ci).Value)) = ci
+        ci = ci + 1
+    Loop
+    Set BuildColMap = d
+End Function
+
+Function SafeCol(d As Object, key As String) As Integer
+    If d.Exists(key) Then SafeCol = d(key) Else SafeCol = 0
+End Function
+
+Function SafeStr(cell As Range) As String
+    If IsNull(cell.Value) Or IsEmpty(cell.Value) Then
+        SafeStr = ""
+    Else
+        SafeStr = Trim(CStr(cell.Value))
+    End If
+End Function
+
+Function SafeNum(cell As Range) As Long
+    If IsNull(cell.Value) Or IsEmpty(cell.Value) Or Not IsNumeric(cell.Value) Then
+        SafeNum = 0
+    Else
+        SafeNum = CLng(cell.Value)
+    End If
+End Function
+
+Function FormatDateCell(v As Variant) As String
+    If IsNull(v) Or IsEmpty(v) Or v = "" Then
+        FormatDateCell = ""
+    ElseIf IsDate(v) Then
+        FormatDateCell = Format(CDate(v), "DD/MM/YYYY")
+    Else
+        FormatDateCell = Trim(CStr(v))
+    End If
+End Function
+
+Sub ClearOutputSheets(wsSUM As Worksheet, wsDET As Worksheet, wsITM As Worksheet)
+    ' Clear data rows, leave header rows intact
+    Dim lastR As Long
+    ' Summary: data from row 5
+    lastR = wsSUM.Cells(wsSUM.Rows.Count, 1).End(xlUp).Row
+    If lastR >= OUT_DATA_START Then wsSUM.Rows(OUT_DATA_START & ":" & lastR).ClearContents
+    ' Detail: data from row 5
+    lastR = wsDET.Cells(wsDET.Rows.Count, 1).End(xlUp).Row
+    If lastR >= OUT_DATA_START Then wsDET.Rows(OUT_DATA_START & ":" & lastR).ClearContents
+    ' Item: data from row 4
+    lastR = wsITM.Cells(wsITM.Rows.Count, 1).End(xlUp).Row
+    If lastR >= 4 Then wsITM.Rows("4:" & lastR).ClearContents
+End Sub
+
+Sub FormatDetailRow(ws As Worksheet, r As Long, dispStatus As String, isOverdue As Boolean, moFlag As String)
+    Dim ci As Integer
+    Dim statusColor As Long, rowBG As Long
+
+    Select Case dispStatus
+        Case "Ready for Dispatch":           statusColor = RGB(198, 239, 206)
+        Case "Partial - Pending Production": statusColor = RGB(255, 235, 156)
+        Case "Pending Production":           statusColor = RGB(255, 199, 206)
+        Case Else:                           statusColor = RGB(255, 255, 255)
+    End Select
+
+    ' Row background based on override flag
+    If moFlag = "YES" Then
+        rowBG = RGB(255, 255, 153)   ' yellow
+    ElseIf moFlag = "NO" Then
+        rowBG = RGB(217, 217, 217)   ' grey
+    Else
+        rowBG = IIf(r Mod 2 = 0, RGB(242, 242, 242), RGB(255, 255, 255))
+    End If
+
+    For ci = 1 To DD_TOTAL_COLS
+        With ws.Cells(r, ci)
+            .Font.Name = "Arial"
+            .Font.Size = 9
+            .Font.Bold = False
+            .Font.Color = RGB(0, 0, 0)
+            .HorizontalAlignment = xlCenter
+            .VerticalAlignment = xlCenter
+            .Borders.LineStyle = xlContinuous
+            .Borders.Color = RGB(191, 191, 191)
+            .Borders.Weight = xlThin
+
+            Select Case ci
+                Case DD_ALLOC_QTY, DD_STATUS
+                    .Interior.Color = statusColor
+                    If ci = DD_STATUS Then .Font.Bold = True
+                Case DD_SHORT_QTY
+                    If ws.Cells(r, ci).Value > 0 Then
+                        .Interior.Color = RGB(255, 199, 206)
+                        .Font.Bold = True
+                    Else
+                        .Interior.Color = RGB(198, 239, 206)
+                    End If
+                Case DD_REQ_DATE, DD_OVERDUE
+                    If isOverdue Then
+                        .Interior.Color = RGB(255, 199, 206)
+                        .Font.Color = RGB(192, 0, 0)
+                        .Font.Bold = (ci = DD_OVERDUE)
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+                Case DD_SO_DATE
+                    If isOverdue Then .Font.Color = RGB(192, 0, 0)
+                    .Interior.Color = rowBG
+                Case DD_MO_FLAG, DD_MO_REM, DD_MO_QTY
+                    If moFlag = "YES" Then
+                        .Interior.Color = RGB(255, 255, 153)
+                    ElseIf moFlag = "NO" Then
+                        .Interior.Color = RGB(217, 217, 217)
+                    Else
+                        .Interior.Color = RGB(255, 255, 255)
+                    End If
+                Case DD_CUST_NAME, DD_ITEM_DESC, DD_AREA, DD_SO_REM, DD_SP_NAME, DD_MO_REM
+                    .Interior.Color = rowBG
+                    .HorizontalAlignment = xlLeft
+                Case Else
+                    .Interior.Color = rowBG
+            End Select
+        End With
+    Next ci
+End Sub
+
+Sub FormatSummaryRow(ws As Worksheet, r As Long, cs As Variant)
+
+    Dim rowBG As Long
+    rowBG = IIf(r Mod 2 = 0, RGB(242, 242, 242), RGB(255, 255, 255))
+
+    Dim ci As Integer
+
+    For ci = 1 To 13
+        With ws.Cells(r, ci)
+
+            ' Font settings
+            .Font.Name = "Arial"
+            .Font.Size = 9
+            .Font.Bold = False
+            .Font.Color = RGB(0, 0, 0)
+
+            ' Alignment
+            .VerticalAlignment = xlCenter
+
+            ' Borders
+            .Borders.LineStyle = xlContinuous
+            .Borders.Color = RGB(191, 191, 191)
+            .Borders.Weight = xlThin
+
+            ' Column-specific formatting
+            Select Case ci
+
+                Case 1, 3, 4, 5, 6, 11, 12, 13
+                    .HorizontalAlignment = xlCenter
+                    .Interior.Color = rowBG
+
+                Case 2
+                    .HorizontalAlignment = xlLeft
+                    .Interior.Color = rowBG
+
+                Case 7
+                    If cs(1) > 0 Then
+                        .Interior.Color = RGB(198, 239, 206)
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+                    .HorizontalAlignment = xlCenter
+
+                Case 8
+                    If cs(2) > 0 Then
+                        .Interior.Color = RGB(255, 235, 156)
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+                    .HorizontalAlignment = xlCenter
+
+                Case 9
+                    If cs(3) > 0 Then
+                        .Interior.Color = RGB(255, 199, 206)
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+                    .HorizontalAlignment = xlCenter
+
+                Case 10
+                    If cs(4) > 0 Then
+                        .Interior.Color = RGB(255, 199, 206)
+                        .Font.Color = RGB(192, 0, 0)
+                        .Font.Bold = True
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+                    .HorizontalAlignment = xlCenter
+
+            End Select
+
+        End With
+    Next ci
+
+End Sub
+
+Sub FormatItemRow(ws As Worksheet, r As Long, isArr As Variant)
+
+    Dim rowBG As Long
+    rowBG = IIf(r Mod 2 = 0, RGB(242, 242, 242), RGB(255, 255, 255))
+
+    Dim ci As Integer
+
+    For ci = 1 To 6
+        With ws.Cells(r, ci)
+
+            ' Font settings
+            .Font.Name = "Arial"
+            .Font.Size = 9
+            .Font.Bold = False
+            .Font.Color = RGB(0, 0, 0)
+
+            ' Alignment
+            .VerticalAlignment = xlCenter
+
+            ' Borders
+            .Borders.LineStyle = xlContinuous
+            .Borders.Color = RGB(191, 191, 191)
+            .Borders.Weight = xlThin
+
+            ' Column-specific formatting
+            Select Case ci
+
+                Case 1, 2
+                    .HorizontalAlignment = xlLeft
+                    .Interior.Color = rowBG
+
+                Case 3, 4
+                    .HorizontalAlignment = xlCenter
+                    .Interior.Color = rowBG
+
+                Case 5
+                    .HorizontalAlignment = xlCenter
+                    If isArr(2) > 0 Then
+                        .Interior.Color = RGB(198, 239, 206)
+                    Else
+                        .Interior.Color = rowBG
+                    End If
+
+                Case 6
+                    .HorizontalAlignment = xlCenter
+                    If isArr(3) > 0 Then
+                        .Interior.Color = RGB(255, 199, 206)
+                        .Font.Bold = True
+                    Else
+                        .Interior.Color = RGB(198, 239, 206)
+                    End If
+
+            End Select
+
+        End With
+    Next ci
+
+End Sub
+
+Sub FormatHistoryOverrideCells(ws As Worksheet, r As Long, moFlag As String)
+    Dim ci As Integer
+    For ci = DD_MO_FLAG To DD_MO_QTY
+        With ws.Cells(r, ci)
+            If moFlag = "YES" Then
+                .Interior.Color = RGB(255, 255, 153)
+            ElseIf moFlag = "NO" Then
+                .Interior.Color = RGB(217, 217, 217)
+            Else
+                .Interior.Color = RGB(255, 255, 255)
+            End If
+        End With
+    Next ci
+End Sub
+
+Function GetCurrentHistorySheet() As Worksheet
+    ' Find last sheet named History or History_N
+    Dim ws As Worksheet, bestWs As Worksheet, bestNum As Integer
+    bestNum = 0
+    For Each ws In ThisWorkbook.Sheets
+        If ws.Name = SH_HISTORY Then
+            If bestNum = 0 Then Set bestWs = ws: bestNum = 1
+        ElseIf Left(ws.Name, 8) = "History_" Then
+            Dim num As Integer
+            num = CInt(Mid(ws.Name, 9))
+            If num > bestNum Then Set bestWs = ws: bestNum = num
+        End If
+    Next ws
+    If bestWs Is Nothing Then Set bestWs = ThisWorkbook.Sheets(SH_HISTORY)
+    Set GetCurrentHistorySheet = bestWs
+End Function
+
+Function CreateNewHistorySheet() As Worksheet
+    Dim existing As Integer: existing = 0
+    Dim ws As Worksheet
+    For Each ws In ThisWorkbook.Sheets
+        If Left(ws.Name, 7) = "History" Then existing = existing + 1
+    Next ws
+    Dim newName As String
+    newName = "History_" & (existing + 1)
+    Dim srcWs As Worksheet
+    Set srcWs = ThisWorkbook.Sheets(SH_HISTORY)
+    srcWs.Copy After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count)
+    Dim newWs As Worksheet
+    Set newWs = ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count)
+    newWs.Name = newName
+    ' Clear data
+    Dim lr As Long
+    lr = newWs.Cells(newWs.Rows.Count, 1).End(xlUp).Row
+    If lr >= 4 Then newWs.Rows("4:" & lr).ClearContents
+    Set CreateNewHistorySheet = newWs
+End Function
